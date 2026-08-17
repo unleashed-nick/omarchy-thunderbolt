@@ -1,0 +1,338 @@
+#!/usr/bin/env python3
+"""JSON frontend for org.freedesktop.bolt.
+
+Talks to boltd through `busctl --json=short` so the QML service never has to
+parse boltctl's human text. `monitor` uses `boltctl monitor` because
+`busctl monitor` requires BecomeMonitor, which a session user is denied.
+"""
+
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+
+BUS = "org.freedesktop.bolt"
+MANAGER = "/org/freedesktop/bolt"
+MANAGER_IFACE = "org.freedesktop.bolt1.Manager"
+DEVICE_IFACE = "org.freedesktop.bolt1.Device"
+DOMAIN_IFACE = "org.freedesktop.bolt1.Domain"
+PROPS_IFACE = "org.freedesktop.DBus.Properties"
+
+
+class BoltError(Exception):
+    def __init__(self, message: str, code: int = 1) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def fail(message: str, code: int = 1) -> None:
+    print(json.dumps({"ok": False, "error": message}), flush=True)
+    raise SystemExit(code)
+
+
+def unwrap(obj):
+    if not isinstance(obj, dict) or "type" not in obj or "data" not in obj:
+        return obj
+    kind = str(obj.get("type") or "")
+    data = obj.get("data")
+    if kind.startswith("a{"):
+        if isinstance(data, list) and data and isinstance(data[0], dict):
+            data = data[0]
+        if isinstance(data, dict):
+            return {key: unwrap(value) for key, value in data.items()}
+        return data
+    if kind.startswith("a") and kind != "s":
+        if isinstance(data, list) and len(data) == 1 and isinstance(data[0], list):
+            data = data[0]
+        if isinstance(data, list):
+            return [unwrap(item) for item in data]
+        return data
+    return data
+
+
+def run_busctl(args: list[str], timeout: float = 12) -> dict:
+    cmd = ["busctl", "--system", "--json=short", *args]
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise BoltError("busctl is not installed") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise BoltError("bolt D-Bus call timed out") from exc
+
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "busctl failed").strip()
+        raise BoltError(err)
+    text = (proc.stdout or "").strip()
+    if not text:
+        return {}
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise BoltError("could not parse busctl JSON") from exc
+
+
+def bus_call(path: str, iface: str, method: str, *args: str):
+    return unwrap(run_busctl(["call", BUS, path, iface, method, *args]))
+
+
+def get_all(path: str, iface: str) -> dict:
+    raw = bus_call(path, PROPS_IFACE, "GetAll", "s", iface)
+    return raw if isinstance(raw, dict) else {}
+
+
+def set_property(path: str, iface: str, name: str, signature: str, value: str) -> None:
+    # set-property has no useful JSON payload; do not pass --json.
+    cmd = [
+        "busctl",
+        "--system",
+        "set-property",
+        BUS,
+        path,
+        iface,
+        name,
+        signature,
+        value,
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30, check=False)
+    except FileNotFoundError as exc:
+        raise BoltError("busctl is not installed") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise BoltError("bolt D-Bus call timed out") from exc
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "failed to set property").strip()
+        raise BoltError(err)
+
+
+def device_path(uid: str) -> str:
+    return f"{MANAGER}/devices/{uid.replace('-', '_')}"
+
+
+def project_device(path: str, props: dict) -> dict:
+    uid = str(props.get("Uid") or "")
+    name = str(props.get("Name") or "")
+    vendor = str(props.get("Vendor") or "")
+    label = str(props.get("Label") or "").strip()
+    if not label:
+        label = " ".join(part for part in (vendor, name) if part).strip() or uid
+    status = str(props.get("Status") or "unknown")
+    return {
+        "path": path,
+        "uid": uid,
+        "name": name,
+        "vendor": vendor,
+        "label": label,
+        "type": str(props.get("Type") or ""),
+        "generation": int(props.get("Generation") or 0),
+        "status": status,
+        "authFlags": str(props.get("AuthFlags") or ""),
+        "parent": str(props.get("Parent") or ""),
+        "sysfsPath": str(props.get("SysfsPath") or ""),
+        "domain": str(props.get("Domain") or ""),
+        "stored": bool(props.get("Stored")),
+        "policy": str(props.get("Policy") or ""),
+        "key": str(props.get("Key") or ""),
+        "authorized": status == "authorized",
+        "connected": status in ("connected", "connecting", "authorizing", "authorized", "auth-error"),
+    }
+
+
+def project_domain(path: str, props: dict) -> dict:
+    return {
+        "path": path,
+        "uid": str(props.get("Uid") or ""),
+        "id": str(props.get("Id") or ""),
+        "sysfsPath": str(props.get("SysfsPath") or ""),
+        "securityLevel": str(props.get("SecurityLevel") or ""),
+        "iommu": bool(props.get("IOMMU")),
+        "bootAcl": [str(item) for item in (props.get("BootACL") or []) if item],
+    }
+
+
+def snapshot() -> dict:
+    try:
+        manager = get_all(MANAGER, MANAGER_IFACE)
+    except BoltError as exc:
+        return {
+            "ok": False,
+            "boltAvailable": False,
+            "error": str(exc),
+            "manager": {},
+            "domains": [],
+            "devices": [],
+        }
+
+    domain_paths = bus_call(MANAGER, MANAGER_IFACE, "ListDomains") or []
+    device_paths = bus_call(MANAGER, MANAGER_IFACE, "ListDevices") or []
+    domains = []
+    for path in domain_paths:
+        try:
+            domains.append(project_domain(path, get_all(path, DOMAIN_IFACE)))
+        except BoltError:
+            continue
+    devices = []
+    for path in device_paths:
+        try:
+            devices.append(project_device(path, get_all(path, DEVICE_IFACE)))
+        except BoltError:
+            continue
+
+    primary = domains[0] if domains else {}
+    return {
+        "ok": True,
+        "boltAvailable": True,
+        "error": "",
+        "manager": {
+            "version": int(manager.get("Version") or 0),
+            "probing": bool(manager.get("Probing")),
+            "defaultPolicy": str(manager.get("DefaultPolicy") or "auto"),
+            "securityLevel": str(manager.get("SecurityLevel") or ""),
+            "authMode": str(manager.get("AuthMode") or ""),
+            "powerState": str(manager.get("PowerState") or ""),
+            "generation": int(manager.get("Generation") or 0),
+        },
+        "domains": domains,
+        "devices": devices,
+        "domainPresent": len(domains) > 0,
+        "securityLevel": str(primary.get("securityLevel") or manager.get("SecurityLevel") or ""),
+        "iommu": bool(primary.get("iommu")),
+    }
+
+
+def require_uid(uid: str) -> str:
+    value = (uid or "").strip()
+    if not value:
+        raise BoltError("missing device uid")
+    return value
+
+
+def cmd_authorize(uid: str) -> dict:
+    uid = require_uid(uid)
+    bus_call(device_path(uid), DEVICE_IFACE, "Authorize", "s", "")
+    return {"ok": True, "uid": uid, "action": "authorize"}
+
+
+def cmd_enroll(uid: str, policy: str) -> dict:
+    uid = require_uid(uid)
+    chosen = (policy or "auto").strip().lower()
+    if chosen not in ("auto", "manual", "default"):
+        raise BoltError("policy must be auto, manual, or default")
+    bus_call(MANAGER, MANAGER_IFACE, "EnrollDevice", "sss", uid, chosen, "")
+    return {"ok": True, "uid": uid, "action": "enroll", "policy": chosen}
+
+
+def cmd_forget(uid: str) -> dict:
+    uid = require_uid(uid)
+    bus_call(MANAGER, MANAGER_IFACE, "ForgetDevice", "s", uid)
+    return {"ok": True, "uid": uid, "action": "forget"}
+
+
+def cmd_set_auth_mode(mode: str) -> dict:
+    chosen = (mode or "").strip().lower()
+    if chosen not in ("enabled", "disabled"):
+        raise BoltError("auth mode must be enabled or disabled")
+    set_property(MANAGER, MANAGER_IFACE, "AuthMode", "s", chosen)
+    return {"ok": True, "action": "set-auth-mode", "authMode": chosen}
+
+
+def cmd_set_policy(uid: str, policy: str) -> dict:
+    uid = require_uid(uid)
+    chosen = (policy or "").strip().lower()
+    if chosen not in ("auto", "manual"):
+        raise BoltError("policy must be auto or manual")
+    set_property(device_path(uid), DEVICE_IFACE, "Policy", "s", chosen)
+    return {"ok": True, "uid": uid, "action": "set-policy", "policy": chosen}
+
+
+def cmd_monitor() -> int:
+    try:
+        proc = subprocess.Popen(
+            ["boltctl", "monitor"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+    except FileNotFoundError:
+        fail("boltctl is not installed")
+
+    assert proc.stdout is not None
+    ready = False
+    try:
+        for line in proc.stdout:
+            text = line.rstrip("\n")
+            if not ready:
+                if text.strip() == "Ready":
+                    ready = True
+                    print(json.dumps({"ok": True, "event": "ready"}), flush=True)
+                continue
+            print(json.dumps({"ok": True, "event": "changed", "line": text}), flush=True)
+    except BrokenPipeError:
+        pass
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+    return proc.returncode or 0
+
+
+def usage() -> None:
+    fail(
+        "usage: bolt-helper snapshot|monitor|authorize <uid>|enroll <uid> <auto|manual>|forget <uid>|set-auth-mode <enabled|disabled>|set-policy <uid> <auto|manual>",
+        2,
+    )
+
+
+def main(argv: list[str]) -> int:
+    if not argv:
+        usage()
+    cmd = argv[0]
+    try:
+        if cmd == "snapshot":
+            print(json.dumps(snapshot()), flush=True)
+            return 0
+        if cmd == "monitor":
+            return cmd_monitor()
+        if cmd == "authorize":
+            print(json.dumps(cmd_authorize(argv[1] if len(argv) > 1 else "")), flush=True)
+            return 0
+        if cmd == "enroll":
+            print(
+                json.dumps(cmd_enroll(argv[1] if len(argv) > 1 else "", argv[2] if len(argv) > 2 else "auto")),
+                flush=True,
+            )
+            return 0
+        if cmd == "forget":
+            print(json.dumps(cmd_forget(argv[1] if len(argv) > 1 else "")), flush=True)
+            return 0
+        if cmd == "set-auth-mode":
+            print(json.dumps(cmd_set_auth_mode(argv[1] if len(argv) > 1 else "")), flush=True)
+            return 0
+        if cmd == "set-policy":
+            print(
+                json.dumps(cmd_set_policy(argv[1] if len(argv) > 1 else "", argv[2] if len(argv) > 2 else "")),
+                flush=True,
+            )
+            return 0
+        usage()
+    except BoltError as exc:
+        fail(str(exc), exc.code)
+    except IndexError:
+        usage()
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        raise SystemExit(130)
