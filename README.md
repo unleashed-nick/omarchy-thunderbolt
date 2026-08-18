@@ -12,6 +12,12 @@ Thunderbolt.
 It talks to `boltd` over D-Bus. It does **not** write udev rules that
 authorize every device, and it does **not** edit Hyprland monitor config.
 
+| ![Needs approval](preview.png) | ![Connect notifications](tbolt_approval_notification.png) |
+|:---:|:---:|
+| Needs approval | Connect notifications |
+| ![Remembered devices](tbolt_approved.png) | ![Bar hover](tbolt_hover.png) |
+| Remembered devices | Bar hover |
+
 ## Install
 
 ```sh
